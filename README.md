@@ -2,6 +2,8 @@
 
 *本项目基于[Coooookies/netease-cloudmusic-detector](https://github.com/Coooookies/netease-cloudmusic-detector)这一开源项目，使用GLM5.0 Turbo进行重写为Python版本，并保留了原作者的LICENSE。在此感谢原作者的开源*
 
+本项目已上传到Pypi：[网易云音乐检测器 ·PyPI](https://pypi.org/project/netease-cloudmusic-detector/)
+
 **以下为AIGC内容**
 
 使用 Python 监听网易云音乐客户端正在播放中的音乐。

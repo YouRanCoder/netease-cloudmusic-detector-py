@@ -1,32 +1,35 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
 [project]
-name = "netease-cloudmusic-detector"
+name = "uv publish --token pypi-你的令牌"
 version = "1.0.0"
 description = "使用 Python 监听网易云音乐客户端正在播放中的音乐，支持获取 SongId、暂停状态、歌曲进度"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [
-    { name = "Python Reproduction" }
+    { name = "YouRan", email = "205545151@qq.com" }
 ]
 keywords = ["netease", "cloudmusic", "detector", "music"]
 classifiers = [
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
     "Operating System :: Microsoft :: Windows",
+    "License :: OSI Approved :: MIT License",
 ]
 dependencies = []
 
+[project.urls]
+Homepage = "https://github.com/YouRanCoder/netease-cloudmusic-detector"
+Repository = "https://github.com/YouRanCoder/netease-cloudmusic-detector.git"
+
 [project.scripts]
-cloudmusic-detector = "main:main"
+cloudmusic-detector = "cloudmusic_detector.main:main"
 
-[build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
-
-[tool.hatch.build]
+[tool.hatch.build.targets.wheel]
 packages = ["cloudmusic_detector"]
 
 [dependency-groups]
 dev = ["pytest >= 8.0"]
-
-[tool.hatch.build.targets.wheel]
-packages = ["cloudmusic_detector"]
