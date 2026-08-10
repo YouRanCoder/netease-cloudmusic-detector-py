@@ -1,0 +1,83 @@
+"""内部模块：elog 日志解码与解析。"""
+
+import os
+import re
+import time
+from dataclasses import dataclass
+from typing import Optional
+
+
+@dataclass
+class _ElogHeader:
+    pid: str
+    tid: str
+    timestamp: int
+    log_type: str
+    src: str
+    lr: str
+    datetime: str
+
+
+def decode_elog(data: bytes) -> str:
+    """解码 cloudmusic.elog 的自定义二进制编码。"""
+    decoded_bytes = []
+    for byte in data:
+        high = byte >> 4
+        low = byte & 0x0F
+        hex_digit = (high ^ ((low + 8) % 16)) % 16
+        restored = hex_digit * 16 + (byte >> 6) * 4 + (~high & 3)
+        decoded_bytes.append(restored & 0xFF)
+
+    buf = bytes(decoded_bytes)
+    while len(buf) > 0:
+        try:
+            return buf.decode("utf-8")
+        except (UnicodeDecodeError, ValueError):
+            buf = buf[1:]
+    return ""
+
+
+_HEADER_RE = re.compile(
+    r"^\[(\d+):(\d+):(\d{4}/\d{6}:\d+):([A-Z]+):([a-zA-Z0-9._-]+)\((\d+)\)\]\s+"
+    r"\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]"
+)
+
+
+def _get_system_uptime_ms() -> int:
+    if os.name == "nt":
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        try:
+            fn = kernel32.GetTickCount64
+            fn.restype = ctypes.c_uint64
+            return int(fn())
+        except AttributeError:
+            return int(kernel32.GetTickCount())
+    else:
+        try:
+            with open("/proc/uptime") as f:
+                return int(float(f.read().split()[0]) * 1000)
+        except (OSError, IOError):
+            return 0
+
+
+def parse_header(row: str) -> Optional[_ElogHeader]:
+    m = _HEADER_RE.match(row)
+    if not m:
+        return None
+    pid, tid, ts_str, log_type, src, lr, dt = m.groups()
+    startup_time = int(ts_str.split(":")[-1])
+    uptime_ms = _get_system_uptime_ms()
+    now_ms = int(time.time() * 1000)
+    return _ElogHeader(
+        pid=pid, tid=tid,
+        timestamp=startup_time + (now_ms - uptime_ms),
+        log_type=log_type, src=src, lr=lr, datetime=dt,
+    )
+
+
+def get_event_type(row: str, rules: dict) -> Optional[str]:
+    for name, cfg in rules.items():
+        if cfg["rule"](row):
+            return name
+    return None
