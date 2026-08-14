@@ -17,7 +17,9 @@ class _Webdb:
         if self._conn is None:
             if not os.path.exists(self.db_path):
                 raise FileNotFoundError(f"webdb.dat 不存在: {self.db_path}")
-            self._conn = sqlite3.connect(self.db_path)
+            # check_same_thread=False：本地只读缓存，允许在轮询线程/事件循环线程等
+            # 任意线程读取与关闭，避免跨线程访问报 ProgrammingError
+            self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
             self._conn.row_factory = sqlite3.Row
             self._conn.execute("PRAGMA journal_mode = WAL")
         return self._conn

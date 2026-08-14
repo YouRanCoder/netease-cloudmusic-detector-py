@@ -362,6 +362,13 @@ class AsyncCloudMusic(CloudMusic):
     """
     asyncio 版本。回调在事件循环中调度，适合 Tauri / Qt asyncio / 纯 async 框架。
 
+    与同步版的关键差异：
+    - ``start()`` / ``stop()`` 为真正的异步，文件读取、日志回溯等阻塞操作
+      通过 ``asyncio.to_thread`` 在后台线程执行，**不会阻塞事件循环**；
+    - 实时日志处理（含 webdb 查询，单次最多 2 秒）在库内部轮询线程完成，
+      只把轻量的回调调度回事件循环线程；
+    - 回调签名为 ``cb(track)`` / ``cb(state)`` / ``cb(position)``，均在事件循环线程触发。
+
     用法::
 
         from cloudmusic_detector import AsyncCloudMusic
@@ -379,20 +386,43 @@ class AsyncCloudMusic(CloudMusic):
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 
     async def start(self) -> None:
-        """异步启动。"""
+        """异步启动，不阻塞事件循环（文件读取 + 日志回溯在后台线程执行）。"""
         self._loop = asyncio.get_running_loop()
-        lines = self._listener.start()
-        self._preload(lines)
-        self._listener.on_line(self._async_handle_line)
+        lines = await asyncio.to_thread(self._listener.start)
+        await asyncio.to_thread(self._preload, lines)
+        # 实时行处理注册在预载之后，且运行在库内部轮询线程，
+        # 阻塞的 webdb 查询不会占用事件循环
+        self._listener.on_line(self._handle_line)
 
     async def stop(self) -> None:
-        """异步停止。"""
-        self._listener.stop()
+        """异步停止，不阻塞事件循环。"""
+        await asyncio.to_thread(self._listener.stop)
+        # check_same_thread=False 后，webdb 连接可跨线程安全关闭
         self._webdb.close()
 
-    def _async_handle_line(self, line: str) -> None:
-        """将同步回调调度到事件循环。"""
+    def _emit_track(self, track: Track) -> None:
+        """切歌回调：调度到事件循环线程执行。"""
+        self._marshal_callbacks(self._on_track_change_cbs, (track,))
+
+    def _emit_state(self, state: PlayingState) -> None:
+        """播放/暂停回调：调度到事件循环线程执行。"""
+        self._marshal_callbacks(self._on_state_change_cbs, (state,))
+
+    def _emit_seek(self, pos: float) -> None:
+        """进度回调：调度到事件循环线程执行。"""
+        self._marshal_callbacks(self._on_seek_cbs, (pos,))
+
+    def _marshal_callbacks(self, callbacks: list, args: tuple) -> None:
+        """把回调调度到事件循环线程；循环未运行则直接执行（兜底）。"""
         if self._loop and self._loop.is_running():
-            self._loop.call_soon_threadsafe(self._handle_line, line)
+            self._loop.call_soon_threadsafe(self._dispatch_callbacks, callbacks, args)
         else:
-            self._handle_line(line)
+            self._dispatch_callbacks(callbacks, args)
+
+    @staticmethod
+    def _dispatch_callbacks(callbacks: list, args: tuple) -> None:
+        for cb in callbacks:
+            try:
+                cb(*args)
+            except Exception:
+                pass

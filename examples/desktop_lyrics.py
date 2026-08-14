@@ -35,7 +35,6 @@ def demo_polling():
         while True:
             s = cm.state
             if s.has_track:
-                print(
                 print(f"  [{s.state.value:7s}] {s.track.artist_str} - {s.track.name}  "
                       f"{s.position:.1f}s / {s.track.duration:.0f}s  "
                       f"{s.progress:.1%}"
