@@ -18,17 +18,31 @@ class _ElogHeader:
     datetime: str
 
 
-def decode_elog(data: bytes) -> str:
-    """解码 cloudmusic.elog 的自定义二进制编码。"""
-    decoded_bytes = []
-    for byte in data:
+_DECODE_TABLE: Optional[bytes] = None
+
+
+def _build_decode_table() -> bytes:
+    """预计算逐字节解码映射表（纯函数，只依赖输入字节值）。"""
+    table = bytearray(256)
+    for byte in range(256):
         high = byte >> 4
         low = byte & 0x0F
         hex_digit = (high ^ ((low + 8) % 16)) % 16
         restored = hex_digit * 16 + (byte >> 6) * 4 + (~high & 3)
-        decoded_bytes.append(restored & 0xFF)
+        table[byte] = restored & 0xFF
+    return bytes(table)
 
-    buf = bytes(decoded_bytes)
+
+def decode_elog(data: bytes) -> str:
+    """解码 cloudmusic.elog 的自定义二进制编码。
+
+    解码是逐字节的纯函数，用查表 + ``bytes.translate``（C 实现）加速，
+    避免在大文件（可达 10MB+）上做逐字节 Python 循环而长时间占用 GIL。
+    """
+    global _DECODE_TABLE
+    if _DECODE_TABLE is None:
+        _DECODE_TABLE = _build_decode_table()
+    buf = data.translate(_DECODE_TABLE)
     while len(buf) > 0:
         try:
             return buf.decode("utf-8")
