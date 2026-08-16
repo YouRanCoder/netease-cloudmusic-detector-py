@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "netease-cloudmusic-detector"
-version = "2.0.3"
+version = "2.0.4"
 description = "使用 Python 监听网易云音乐客户端正在播放中的音乐，支持获取 SongId、暂停状态、歌曲进度"
 readme = "README.md"
 requires-python = ">=3.10"

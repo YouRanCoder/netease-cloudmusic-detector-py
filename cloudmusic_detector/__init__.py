@@ -1,4 +1,4 @@
-"""
+﻿"""
 cloudmusic_detector — 网易云音乐播放状态监听库
 
 面向桌面歌词软件的封装接口。
@@ -46,4 +46,4 @@ __all__ = [
     "PlayingState",
     "PlayState",
 ]
-__version__ = "2.0.3"
+__version__ = "2.0.4"

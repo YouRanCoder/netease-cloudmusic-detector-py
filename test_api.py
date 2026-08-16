@@ -3,8 +3,11 @@ import os
 
 sys.path.insert(0, os.path.dirname(__file__))
 
+import time
+
 from cloudmusic_detector import CloudMusic, AsyncCloudMusic, Track, PlayingState, PlayState
 from cloudmusic_detector._constant import ELOG_RULES
+from cloudmusic_detector._elog_analysis import _build_decode_table, decode_elog
 
 
 def test_types():
@@ -213,6 +216,34 @@ def test_state_machine_position():
     print()
 
 
+def test_decode_elog_perf():
+    print("=== 测试 7: decode_elog 大文件解码性能（坏字节不应触发 O(P·n)） ===")
+
+    table = _build_decode_table()
+    # 计算逆映射（磁盘字节 -> 文本字节 是 table；文本字节 -> 磁盘字节 是逆置换）
+    inverse = bytearray(256)
+    for b in range(256):
+        inverse[table[b]] = b
+    inverse = bytes(inverse)
+
+    line = '[123:456:2024/011010:1000:INFO:abc(1)] 2024-01-01 10:00:00 【playing】,"checkPlayPrivilege",{"id":1}'
+    payload = (line.encode("utf-8") + b"\n") * 90000
+    disk = payload.translate(inverse)
+
+    # 中部 1/3 处注入一个坏字节，模拟真实 elog 的乱码
+    pos = len(disk) // 3
+    bad = disk[:pos] + b"\xff" + disk[pos:]
+    assert len(bad) > 8 * 1024 * 1024, f"测试数据应大于 8MB，实际 {len(bad)}"
+
+    t0 = time.time()
+    out = decode_elog(bad)
+    dt = time.time() - t0
+    assert out.count("\n") == 90000, f"行数应完整保留，实际 {out.count(chr(10))}"
+    assert dt < 1.0, f"解码耗时超过 1s（疑似 O(P·n) 剥头循环），实际 {dt:.3f}s"
+    print(f"  8.8MB + 中部坏字节解码 {dt*1000:.1f}ms，行数 90000 OK")
+    print()
+
+
 if __name__ == "__main__":
     print("cloudmusic_detector API 测试\n")
     print("-" * 50)
@@ -222,5 +253,6 @@ if __name__ == "__main__":
     test_make_track()
     test_file_structure()
     test_state_machine_position()
+    test_decode_elog_perf()
     print("-" * 50)
     print("\nAll passed!")
