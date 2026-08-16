@@ -197,7 +197,10 @@ class CloudMusic:
         self._track = track
         self._pausing = pausing
         self._position = 0.0
-        self._relative_time = 0
+        # pausing=False（PLAY_ONE 立即播放）时若 _relative_time 为 0，
+        # state.position 会变成 (now-0)/1000 = Unix 秒级时间戳（历史 bug），
+        # 这里把基准时间设为当前时刻，使进度从 0 正常递增。
+        self._relative_time = 0 if pausing else int(time.time() * 1000)
         self._emit_track(track)
 
     def _preload(self, lines: list[str]) -> None:
@@ -215,7 +218,7 @@ class CloudMusic:
             header = parse_header(line)
             if not header:
                 continue
-            records.insert(0, line)
+            records.append(line)
 
             etype = get_event_type(line, ELOG_RULES)
             if etype is None:
@@ -248,6 +251,7 @@ class CloudMusic:
                 break
 
         # 正序回放进度和状态
+        records.reverse()
         last_action = song_play_time
         for line in records:
             header = parse_header(line)

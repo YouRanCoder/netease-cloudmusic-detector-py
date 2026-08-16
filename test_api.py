@@ -192,6 +192,27 @@ def test_file_structure():
     print()
 
 
+def test_state_machine_position():
+    print("=== 测试 6: 进度状态机（position 不应是 Unix 时间戳） ===")
+
+    cm = CloudMusic()
+    track = Track(id=12345, name="测试歌曲", duration=240.0)
+
+    # 模拟 PLAY_ONE_TRACKIN_PLAYING_LIST：切歌后立即播放
+    cm._set_new_track(track, pausing=False)
+    pos = cm.state.position
+    assert 0 <= pos < 60, f"播放中 position 应为秒级小值，实际 {pos} (疑似 Unix 时间戳)"
+    assert cm.is_playing
+    print(f"  立即播放 position={pos:.3f}s OK (is_playing={cm.is_playing})")
+
+    # 模拟 SET_PLAYING：切歌后暂停，position 应为 0
+    cm._set_new_track(track, pausing=True)
+    assert cm.state.position == 0.0
+    assert cm.state.is_paused
+    print("  暂停 position=0 OK")
+    print()
+
+
 if __name__ == "__main__":
     print("cloudmusic_detector API 测试\n")
     print("-" * 50)
@@ -200,5 +221,6 @@ if __name__ == "__main__":
     test_api_surface()
     test_make_track()
     test_file_structure()
+    test_state_machine_position()
     print("-" * 50)
     print("\nAll passed!")
