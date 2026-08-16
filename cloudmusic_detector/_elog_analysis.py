@@ -20,6 +20,24 @@ class _ElogHeader:
 
 _DECODE_TABLE: Optional[bytes] = None
 
+# 系统运行时长（毫秒）与 wall-clock 的基准缓存：
+# parse_header 在回溯（_preload）时会对每一行调用，而 GetTickCount64 / time.time
+# 都是系统调用，在大日志（几十万行）上会显著拖慢启动。批量解析期间基准几乎不变，
+# 缓存后在单个处理周期内复用，避免每行都触发系统调用。
+_uptime_cache_ms: int = -1
+_uptime_cache_at: float = 0.0
+
+
+def _get_system_uptime_ms_cached() -> int:
+    global _uptime_cache_ms, _uptime_cache_at
+    now = time.time()
+    # 1 秒内复用缓存
+    if _uptime_cache_ms >= 0 and (now - _uptime_cache_at) < 1.0:
+        return _uptime_cache_ms
+    _uptime_cache_at = now
+    _uptime_cache_ms = _get_system_uptime_ms()
+    return _uptime_cache_ms
+
 
 def _build_decode_table() -> bytes:
     """预计算逐字节解码映射表（纯函数，只依赖输入字节值）。"""
@@ -81,7 +99,7 @@ def parse_header(row: str) -> Optional[_ElogHeader]:
         return None
     pid, tid, ts_str, log_type, src, lr, dt = m.groups()
     startup_time = int(ts_str.split(":")[-1])
-    uptime_ms = _get_system_uptime_ms()
+    uptime_ms = _get_system_uptime_ms_cached()
     now_ms = int(time.time() * 1000)
     return _ElogHeader(
         pid=pid, tid=tid,
