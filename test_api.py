@@ -244,6 +244,36 @@ def test_decode_elog_perf():
     print()
 
 
+def test_hash_song_id():
+    print("=== 测试 8: 哈希 songId（本地/无服务器 ID 歌曲）不应崩溃 ===")
+
+    cm = CloudMusic()
+
+    # 安全转换：哈希/None → -1，正常数字 → 原值
+    assert cm._safe_song_id("FB5D760B1179E3A2E0EA339D9C8531AD0DC0873F") == -1
+    assert cm._safe_song_id(None) == -1
+    assert cm._safe_song_id("12345") == 12345
+    assert cm._safe_song_id(-1) == -1
+    print("  _safe_song_id 哈希/None/数字 OK")
+
+    # _make_track 遇到哈希 id 不崩
+    t = cm._make_track({"id": "FB5D760B1179E3A2E0EA339D9C8531AD0DC0873F", "name": "本地歌曲"})
+    assert t.id == -1
+    assert t.name == "本地歌曲"
+    print("  _make_track 哈希 id → Track(id=-1) OK")
+
+    # _preload 遇到 NATIVE_SONG_LOAD + 哈希 songId 不崩（跳过 webdb 继续回溯）
+    header = "[123:456:2024/011010:1000:INFO:abc(1)] 2024-01-01 10:00:00"
+    hash_line = f'{header} 【playing】,"native播放资源load完成，开始播放",{{"songId":"FB5D760B1179E3A2E0EA339D9C8531AD0DC0873F"}}'
+    int_line = f'{header} 【playing】,"native播放资源load完成，开始播放",{{"songId":"12345"}}'
+    try:
+        cm._preload([hash_line, int_line])
+        print("  _preload 哈希 songId 行 OK（未抛 ValueError）")
+    except ValueError as e:
+        raise AssertionError(f"_preload 仍抛 ValueError: {e}")
+    print()
+
+
 if __name__ == "__main__":
     print("cloudmusic_detector API 测试\n")
     print("-" * 50)
@@ -254,5 +284,6 @@ if __name__ == "__main__":
     test_file_structure()
     test_state_machine_position()
     test_decode_elog_perf()
+    test_hash_song_id()
     print("-" * 50)
     print("\nAll passed!")

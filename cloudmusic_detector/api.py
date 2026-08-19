@@ -176,6 +176,18 @@ class CloudMusic:
         self._position = 0.0
         self._relative_time = 0
 
+    def _safe_song_id(self, value: object, default: int = -1) -> int:
+        """把 songId / id 安全转为整数。
+
+        网易云对本地导入 / 无服务器 ID 的下载曲会用文件哈希（40 位十六进制，
+        如 FB5D760B...）作 ID。这类值无法 int() 转换，直接返回 default，
+        避免 _preload 回溯到本地歌曲记录时崩溃。
+        """
+        try:
+            return int(value)
+        except (ValueError, TypeError):
+            return default
+
     def _make_track(self, data: dict) -> Track:
         """从 JSON 数据构建 Track（兼容 SET_PLAYING / PLAY_ONE / webdb 三种结构）。"""
         # SET_PLAYING 结构: {id, name, artists:[{name}], album:{name, cover}, duration}
@@ -184,7 +196,7 @@ class CloudMusic:
         track_data = data.get("track", data)
         album = track_data.get("album", {})
         return Track(
-            id=int(track_data.get("id", track_data.get("songId", -1))),
+            id=self._safe_song_id(track_data.get("id", track_data.get("songId", -1))),
             name=track_data.get("name", ""),
             artists=tuple(a.get("name", "") for a in track_data.get("artists", [])),
             album=album.get("name", ""),
@@ -242,12 +254,15 @@ class CloudMusic:
             if etype == "NATIVE_SONG_LOAD":
                 data = parse_args(etype, line)
                 if data and isinstance(data, dict):
-                    sid = int(data.get("songId", -1))
-                    detail = self._webdb.wait_for_song_detail(sid, timeout=2)
-                    if detail:
-                        song_track = self._make_track(detail)
-                        song_id = song_track.id
-                        song_play_time = header.timestamp
+                    sid = self._safe_song_id(data.get("songId", -1))
+                    # 哈希型 songId（本地导入/无服务器 ID 的下载曲）无法查 webdb，
+                    # 跳过该记录继续回溯更早的切歌事件
+                    if sid != -1:
+                        detail = self._webdb.wait_for_song_detail(sid, timeout=2)
+                        if detail:
+                            song_track = self._make_track(detail)
+                            song_id = song_track.id
+                            song_play_time = header.timestamp
                 break
 
         # 正序回放进度和状态
@@ -324,8 +339,11 @@ class CloudMusic:
             data = parse_args(etype, line)
             if not data or not isinstance(data, dict):
                 return
-            new_id = int(data.get("songId", -1))
+            new_id = self._safe_song_id(data.get("songId", -1))
             if new_id == self._song_id:
+                return
+            # 哈希型 songId（本地导入/无服务器 ID 的下载曲）无法查 webdb，忽略该事件
+            if new_id == -1:
                 return
             detail = self._webdb.wait_for_song_detail(new_id, timeout=2)
             if not detail:
