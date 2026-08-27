@@ -274,6 +274,101 @@ def test_hash_song_id():
     print()
 
 
+def test_song_load_rebase():
+    print("=== 测试 9: NATIVE_SONG_LOAD 出声点校准（歌词提前修复） ===")
+
+    from cloudmusic_detector._elog_analysis import _get_system_uptime_ms, parse_header
+
+    cm = CloudMusic()
+
+    # 行内 startup_time 必须接近当前 uptime，模拟"刚写下的日志"（offset≈0）
+    startup = _get_system_uptime_ms()
+    header = f"[123:456:0818/163136:{startup}:INFO:abc(1)] [2024-01-01 10:00:00]"
+
+    def load_line(sid):
+        return (f'{header} 【playing】,"native播放资源load完成，开始播放",'
+                f'{{"songId":"{sid}","bitrate":320}}')
+
+    def pos_line(sec):
+        return f'{header} 【playing】,"setPlayingPosition",{sec}'
+
+    # 流程 A：PLAY_ONE 立即起表 → 缓冲 3s → SONG_LOAD 应把进度校准回 ~0
+    cm._set_new_track(Track(id=1, name="A", duration=300.0), pausing=False)
+    cm._relative_time -= 3000  # 模拟 PLAY_ONE 先于出声 3 秒（库内进度已领先）
+    assert cm.state.position > 2.5, f"前置条件：缓冲期进度应领先 ~3s，实际 {cm.state.position}"
+    cm._handle_line(load_line(1))
+    assert cm.state.position < 0.5, f"出声点应归零，实际 {cm.state.position}"
+    print(f"  缓冲期领先 3s → SONG_LOAD 校准后 position={cm.state.position:.3f}s OK")
+
+    # seek（setPlayingPosition）后的 SONG_LOAD 重载：不得归零
+    cm._handle_line(pos_line(120))
+    cm._relative_time -= 2000  # 拖拽后 2s，重载完成
+    cm._handle_line(load_line(1))
+    assert 119 <= cm.state.position <= 123, f"seek 后重载不应归零，实际 {cm.state.position}"
+    print(f"  seek 到 120s 后重载 position={cm.state.position:.3f}s（未被破坏）OK")
+
+    # 暂停中的 SONG_LOAD：不归零
+    cm._handle_line(f'{header} 【playing】,"native播放state",2,')
+    paused_pos = cm.state.position
+    cm._handle_line(load_line(1))
+    assert abs(cm.state.position - paused_pos) < 1.0, "暂停中 SONG_LOAD 不应改变进度"
+    print("  暂停中 SONG_LOAD 进度不变 OK")
+
+    # 切歌后标志复位：新歌的首个 SONG_LOAD 仍可校准
+    cm._set_new_track(Track(id=2, name="B", duration=300.0), pausing=False)
+    cm._relative_time -= 4000
+    cm._handle_line(load_line(2))
+    assert cm.state.position < 0.5, f"新歌首个 SONG_LOAD 应校准归零，实际 {cm.state.position}"
+    print("  切歌后标志复位，新歌 SONG_LOAD 校准 OK")
+
+    # 陈旧事件（elog 重读/跨会话旧行，offset 巨大）：不得重置进度
+    old_startup = 1000  # 假装是很久以前（开机第 1 秒）写的日志
+    old_header = f"[123:456:0818/163136:{old_startup}:INFO:abc(1)] [2024-01-01 10:00:00]"
+    stale_line = (f'{old_header} 【playing】,"native播放资源load完成，开始播放",'
+                  f'{{"songId":"2","bitrate":320}}')
+    cm._relative_time -= 2000
+    pos_before_stale = cm.state.position
+    cm._handle_line(stale_line)
+    assert abs(cm.state.position - pos_before_stale) < 0.5, \
+        f"陈旧 SONG_LOAD 不应重置进度，{pos_before_stale} -> {cm.state.position}"
+    print(f"  陈旧事件（offset 巨大）进度保持 {pos_before_stale:.2f}s 不变 OK")
+
+    # 同曲重播：进度已走完（外推越过时长）时，即使被锚定过也应归零重新起表
+    cm._handle_line(f'{header} 【playing】,"native播放state",1,')  # 恢复播放，锚定标志置位
+    cm._relative_time -= int(302 * 1000)  # 外推 302s > 时长 300s（歌已播完）
+    assert cm.state.position >= 299.5, f"前置条件：进度应已到末尾，实际 {cm.state.position}"
+    cm._handle_line(load_line(2))
+    assert cm.state.position < 0.5, f"同曲重播应归零，实际 {cm.state.position}"
+    print("  同曲重播（进度已走完）SONG_LOAD 归零 OK")
+
+    # 对照：锚定过且仍在歌曲中途的 SONG_LOAD（seek 重载）不归零
+    cm._handle_line(pos_line(80))
+    cm._relative_time -= 1000
+    cm._handle_line(load_line(2))
+    assert 79 <= cm.state.position <= 82, f"中途重载不应归零，实际 {cm.state.position}"
+    print("  中途重载（锚定过且未播完）进度保持 OK")
+    print()
+
+
+def test_header_timestamp_no_jitter():
+    print("=== 测试 10: parse_header 时间戳无缓存抖动 ===")
+
+    from cloudmusic_detector._elog_analysis import _get_system_uptime_ms, parse_header
+
+    row = f"[123:456:0818/163136:{_get_system_uptime_ms()}:INFO:abc(1)] [2024-01-01 10:00:00] 【playing】,\"setPlayingPosition\",1"
+    t1 = parse_header(row).timestamp
+    time.sleep(0.05)
+    t2 = parse_header(row).timestamp
+    assert t1 == t2, f"同一行的时间戳应恒定（旧实现带 0~1s 缓存抖动）：{t1} != {t2}"
+    print(f"  同一行两次解析 timestamp 一致（{t1}）OK")
+
+    # 时间戳应接近当前时刻（= 事件真实 wall 时间）
+    now_ms = time.time() * 1000
+    assert abs(t1 - now_ms) < 100, f"timestamp 应≈当前时刻，偏差 {t1 - now_ms}ms"
+    print(f"  timestamp 与当前时刻偏差 {t1 - now_ms:.0f}ms OK")
+    print()
+
+
 if __name__ == "__main__":
     print("cloudmusic_detector API 测试\n")
     print("-" * 50)
@@ -285,5 +380,7 @@ if __name__ == "__main__":
     test_state_machine_position()
     test_decode_elog_perf()
     test_hash_song_id()
+    test_song_load_rebase()
+    test_header_timestamp_no_jitter()
     print("-" * 50)
     print("\nAll passed!")

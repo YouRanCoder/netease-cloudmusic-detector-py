@@ -20,23 +20,24 @@ class _ElogHeader:
 
 _DECODE_TABLE: Optional[bytes] = None
 
-# 系统运行时长（毫秒）与 wall-clock 的基准缓存：
-# parse_header 在回溯（_preload）时会对每一行调用，而 GetTickCount64 / time.time
-# 都是系统调用，在大日志（几十万行）上会显著拖慢启动。批量解析期间基准几乎不变，
-# 缓存后在单个处理周期内复用，避免每行都触发系统调用。
-_uptime_cache_ms: int = -1
-_uptime_cache_at: float = 0.0
+# 开机时刻（wall-clock 毫秒）缓存：开机时刻在系统运行期间是常量，缓存它即可让
+# parse_header 在大日志（几十万行）回溯时避免每行触发 GetTickCount64 / time.time
+# 系统调用。相比缓存"系统运行时长"，时间戳不再带缓存陈旧偏移——旧实现 1 秒内复用
+# uptime 值会让 timestamp 随机超前 0~1s，进度基准（relative_time）每次重置都会
+# 抖动，歌词软件表现为切歌/拖拽后进度随机慢 0~1s。定期（60s）刷新以吸收 NTP
+# 对系统时钟的大幅校准。
+_boot_time_cache_ms: int = -1
+_boot_time_cached_at: float = 0.0
+_BOOT_TIME_CACHE_TTL: float = 60.0
 
 
-def _get_system_uptime_ms_cached() -> int:
-    global _uptime_cache_ms, _uptime_cache_at
+def _get_boot_time_ms_cached() -> int:
+    global _boot_time_cache_ms, _boot_time_cached_at
     now = time.time()
-    # 1 秒内复用缓存
-    if _uptime_cache_ms >= 0 and (now - _uptime_cache_at) < 1.0:
-        return _uptime_cache_ms
-    _uptime_cache_at = now
-    _uptime_cache_ms = _get_system_uptime_ms()
-    return _uptime_cache_ms
+    if _boot_time_cache_ms < 0 or (now - _boot_time_cached_at) >= _BOOT_TIME_CACHE_TTL:
+        _boot_time_cached_at = now
+        _boot_time_cache_ms = int(now * 1000) - _get_system_uptime_ms()
+    return _boot_time_cache_ms
 
 
 def _build_decode_table() -> bytes:
@@ -97,11 +98,9 @@ def parse_header(row: str) -> Optional[_ElogHeader]:
         return None
     pid, tid, ts_str, log_type, src, lr, dt = m.groups()
     startup_time = int(ts_str.split(":")[-1])
-    uptime_ms = _get_system_uptime_ms_cached()
-    now_ms = int(time.time() * 1000)
     return _ElogHeader(
         pid=pid, tid=tid,
-        timestamp=startup_time + (now_ms - uptime_ms),
+        timestamp=startup_time + _get_boot_time_ms_cached(),
         log_type=log_type, src=src, lr=lr, datetime=dt,
     )
 

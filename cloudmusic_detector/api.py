@@ -65,6 +65,10 @@ class CloudMusic:
         self._pausing: bool = False
         self._position: float = 0.0
         self._relative_time: int = 0
+        # 自最近一次切歌以来，进度基准是否已被显式事件（进度拖拽/播放状态切换）
+        # 锚定过。用于区分 NATIVE_SONG_LOAD 是"切歌后的首次出声"（需要校准）
+        # 还是"seek 后的重新加载"（不能归零，否则破坏拖拽定位）
+        self._pos_anchored_since_switch: bool = False
 
         # 回调
         self._on_track_change_cbs: list[Callable[[Track], None]] = []
@@ -175,6 +179,7 @@ class CloudMusic:
         self._pausing = False
         self._position = 0.0
         self._relative_time = 0
+        self._pos_anchored_since_switch = False
 
     def _safe_song_id(self, value: object, default: int = -1) -> int:
         """把 songId / id 安全转为整数。
@@ -213,6 +218,9 @@ class CloudMusic:
         # state.position 会变成 (now-0)/1000 = Unix 秒级时间戳（历史 bug），
         # 这里把基准时间设为当前时刻，使进度从 0 正常递增。
         self._relative_time = 0 if pausing else int(time.time() * 1000)
+        # 新歌起表：清空"进度已被显式锚定"标记，
+        # 使本歌随后的首个 NATIVE_SONG_LOAD（真正出声点）能校准进度
+        self._pos_anchored_since_switch = False
         self._emit_track(track)
 
     def _preload(self, lines: list[str]) -> None:
@@ -225,6 +233,11 @@ class CloudMusic:
         song_position = 0.0
         song_pausing = False
         song_track: Optional[Track] = None
+        # 回溯锚点是否为 NATIVE_SONG_LOAD（出声点），以及回放途中进度是否被
+        # 显式事件（拖拽/状态切换）锚定过——决定启动后同歌 SONG_LOAD 是否可归零
+        anchor_is_song_load = False
+        replay_anchored = False
+        self._pos_anchored_since_switch = False
 
         for line in reversed(lines):
             header = parse_header(line)
@@ -263,6 +276,8 @@ class CloudMusic:
                             song_track = self._make_track(detail)
                             song_id = song_track.id
                             song_play_time = header.timestamp
+                            # 出声点已作为回溯锚点消费，启动后同歌 SONG_LOAD 不再归零
+                            anchor_is_song_load = True
                 break
 
         # 正序回放进度和状态
@@ -280,6 +295,7 @@ class CloudMusic:
                 if pos is not None:
                     song_position = float(pos)
                     last_action = header.timestamp
+                    replay_anchored = True
             elif etype == "SET_PLAYING_STATUS":
                 st = parse_args("SET_PLAYING_STATUS", line)
                 if st is not None:
@@ -288,6 +304,7 @@ class CloudMusic:
                     song_pausing = (int(st) == 2)
                     if song_pausing:
                         song_position += offset / 1000
+                    replay_anchored = True
 
         if not song_pausing:
             song_position += (now - last_action) / 1000
@@ -296,6 +313,9 @@ class CloudMusic:
         self._pausing = song_pausing
         self._position = song_position if song_pausing else 0
         self._relative_time = 0 if song_pausing else int(now - song_position * 1000)
+        # 出声点已被回溯消费，或回放途中进度被拖拽/状态切换锚定过：
+        # 启动后同歌 NATIVE_SONG_LOAD 视为重载，不归零（保守起见等同旧行为）
+        self._pos_anchored_since_switch = anchor_is_song_load or replay_anchored
         if song_track:
             self._track = song_track
 
@@ -341,6 +361,23 @@ class CloudMusic:
                 return
             new_id = self._safe_song_id(data.get("songId", -1))
             if new_id == self._song_id:
+                # 同一首歌的"资源加载完成，开始播放"：这是真正的出声点。
+                # 播放中且进度可校准时，把进度基准重置到该事件时刻——
+                # 修正 PLAY_ONE 先于出声起表造成的缓冲期进度领先（流媒体
+                # 可达数秒，歌词软件表现为歌词提前），并覆盖同曲重播。
+                # 以下情况不重置，避免破坏已有定位：
+                #   - 暂停中（恢复时由状态事件自行锚定）
+                #   - 事件明显陈旧（offset 大：elog 重读/跨会话旧行）
+                #   - 进度已被拖拽/状态切换锚定，且当前仍在本歌中途
+                #     （seek 后的重新加载）；若进度已走完（外推越过时长，
+                #     同曲重播/单曲循环）则仍应归零重新起表
+                pos_now = (now - self._relative_time) / 1000
+                ended = (self._track.duration > 0
+                         and pos_now >= self._track.duration - 0.25)
+                if (not self._pausing
+                        and abs(offset) < 5.0
+                        and (not self._pos_anchored_since_switch or ended)):
+                    self._relative_time = int(now - offset * 1000)
                 return
             # 哈希型 songId（本地导入/无服务器 ID 的下载曲）无法查 webdb，忽略该事件
             if new_id == -1:
@@ -355,6 +392,7 @@ class CloudMusic:
             self._track = track
             self._position = new_pos - offset if self._pausing else 0
             self._relative_time = 0 if self._pausing else int(new_rel - offset * 1000)
+            self._pos_anchored_since_switch = False
             self._emit_track(track)
             return
 
@@ -365,6 +403,8 @@ class CloudMusic:
             pos = float(pos)
             self._position = pos if self._pausing else 0
             self._relative_time = 0 if self._pausing else int(now - pos * 1000 - offset * 1000)
+            # 进度被显式锚定：本歌随后的 NATIVE_SONG_LOAD 属于 seek 后重新加载，不归零
+            self._pos_anchored_since_switch = True
             self._emit_seek(self.state.position)
             return
 
@@ -377,6 +417,8 @@ class CloudMusic:
             self._pausing = (int(st) == 2)
             self._position = new_pos - offset if self._pausing else 0
             self._relative_time = 0 if self._pausing else int(new_rel - offset * 1000)
+            # 进度被显式锚定：暂停/恢复后的 NATIVE_SONG_LOAD 重载不归零
+            self._pos_anchored_since_switch = True
             self._emit_state(self.state)
 
 
