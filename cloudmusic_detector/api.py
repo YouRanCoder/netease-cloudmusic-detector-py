@@ -5,7 +5,12 @@ from typing import Callable, Optional
 
 from ._elog_listener import _ElogListener
 from ._elog_analysis import parse_header, get_event_type
-from ._constant import CLOUDMUSIC_ELOG_PATH, ELOG_RULES, parse_args
+from ._constant import (
+    CLOUDMUSIC_ELOG_PATH,
+    ELOG_RULES,
+    parse_args,
+    parse_status_play_id,
+)
 from ._webdb import _Webdb
 from .types import Track, PlayingState, PlayState
 
@@ -43,6 +48,9 @@ class CloudMusic:
             await cm.stop()
     """
 
+    # 切歌候选缓存上限：避免长时间运行后无限堆积（远超实际排队歌曲数）
+    _PENDING_LIMIT = 16
+
     def __init__(
         self,
         *,
@@ -69,6 +77,16 @@ class CloudMusic:
         # 锚定过。用于区分 NATIVE_SONG_LOAD 是"切歌后的首次出声"（需要校准）
         # 还是"seek 后的重新加载"（不能归零，否则破坏拖拽定位）
         self._pos_anchored_since_switch: bool = False
+        # 待确认的切歌候选（songId -> Track）。客户端在"加入下一首播放"等场景
+        # 会写 checkPlayPrivilege（播放权限预检），它携带了被插入歌曲的完整信息，
+        # 但当前歌曲并没有切换。若把它当成切歌，歌词软件会提前拉取下一首的
+        # 歌词并停掉当前歌词，且真正切到该曲时因为曲目 ID 已相同而被去重
+        #（不再推送切歌），歌词从此不再出现。
+        # 因此 SET_PLAYING / PLAY_ONE 只登记为候选，等 NATIVE_SONG_LOAD（真正出声）
+        # 或 native播放state 的 playId 确认后，才正式切歌。
+        # 用字典而不是单个槽位：连按几次"下一首播放"不会互相覆盖，且不论用户
+        # 先播哪一首，确认时都能直接拿到完整元数据（无需再查 webdb）。
+        self._pending_tracks: dict[int, Track] = {}
 
         # 回调
         self._on_track_change_cbs: list[Callable[[Track], None]] = []
@@ -180,6 +198,7 @@ class CloudMusic:
         self._position = 0.0
         self._relative_time = 0
         self._pos_anchored_since_switch = False
+        self._pending_tracks.clear()
 
     def _safe_song_id(self, value: object, default: int = -1) -> int:
         """把 songId / id 安全转为整数。
@@ -223,6 +242,54 @@ class CloudMusic:
         self._pos_anchored_since_switch = False
         self._emit_track(track)
 
+    def _mark_pending(self, track: Track, pausing: bool) -> None:
+        """登记切歌候选（尚未确认真正出声）。
+
+        ``pausing`` 保留参数语义以便未来扩展，当前实现统一在确认时按实际
+        播放状态（SONG_LOAD / 播放态事件）决定，不再沿用预检时的猜测。
+
+        候选只在"确认出声"时被消费，不会被当前曲目的播放/暂停事件清掉——
+        清掉只能让后续确认退回 webdb 查询，反而更慢更脆。
+        候选数量有上限，防止长时间运行下无限堆积。
+        """
+        if track.id == self._song_id:
+            # 已是当前曲目：该事件与切歌无关，忽略
+            return
+        if track.id == -1:
+            # 哈希型 songId（本地导入/无服务器 ID）：无法与后续事件比对，
+            # 保持旧行为直接切歌，避免这类歌曲永远不显示
+            self._set_new_track(track, pausing=pausing)
+            return
+        self._pending_tracks.pop(track.id, None)
+        self._pending_tracks[track.id] = track
+        # 只保留最近的若干条（dict 保持插入顺序，超限丢最旧）
+        while len(self._pending_tracks) > self._PENDING_LIMIT:
+            self._pending_tracks.pop(next(iter(self._pending_tracks)))
+
+    def _take_pending(self, song_id: int) -> Optional[Track]:
+        """取出并移除已确认出声的候选；不存在返回 None。"""
+        return self._pending_tracks.pop(song_id, None)
+
+    def _collect_played_song_id(self, line: str) -> Optional[int]:
+        """若该行是"真正出声"证据，返回其歌曲 ID，否则返回 None。
+
+        证据包括：
+          - ``native播放资源load完成，开始播放`` 的 songId；
+          - ``native播放state`` 的 playId 前缀（形如 ``"<songId>_xxx"``）。
+        """
+        if ELOG_RULES["NATIVE_SONG_LOAD"]["rule"](line):
+            data = parse_args("NATIVE_SONG_LOAD", line)
+            if isinstance(data, dict):
+                sid = self._safe_song_id(data.get("songId", -1))
+                return sid if sid != -1 else None
+            return None
+        if ELOG_RULES["SET_PLAYING_STATUS"]["rule"](line):
+            play_id = parse_status_play_id(line)
+            if play_id:
+                sid = self._safe_song_id(play_id.split("_")[0])
+                return sid if sid != -1 else None
+        return None
+
     def _preload(self, lines: list[str]) -> None:
         """启动回溯：倒序找到最近切歌事件，正序回放进度和状态。"""
         now = time.time() * 1000
@@ -238,6 +305,13 @@ class CloudMusic:
         anchor_is_song_load = False
         replay_anchored = False
         self._pos_anchored_since_switch = False
+        # 倒序扫描过程中已经见过的"真正出声"歌曲 ID 集合（比当前行更新）
+        played_ids: set[int] = set()
+        # 已确认出声但 webdb 里查不到元数据的歌曲：继续向更早的日志找它的
+        # 切歌/预检记录以补齐歌名歌手（webdb 只存最近一次播放，通常已过期）
+        anchor_sid = -1
+        anchor_timestamp = 0
+        anchor_records_len = 0
 
         for line in reversed(lines):
             header = parse_header(line)
@@ -256,10 +330,42 @@ class CloudMusic:
             if song_id != -1:
                 continue
 
+            # 记录出声证据（无论是否已定锚点，都要收集给更早的候选判断用）
+            played_sid = self._collect_played_song_id(line)
+            if played_sid is not None:
+                played_ids.add(played_sid)
+
+            if (anchor_sid != -1 and etype in ("SET_PLAYING", "PLAY_ONE_TRACKIN_PLAYING_LIST")):
+                # 已确定出声的歌曲是 anchor_sid，但 webdb 里查不到它的元数据：
+                # 继续向更早的日志找同一首的切歌/预检记录，那里带着完整歌名歌手。
+                data = parse_args(etype, line)
+                if data and isinstance(data, dict):
+                    candidate = self._make_track(data)
+                    if candidate.id == anchor_sid:
+                        song_track = candidate
+                        song_id = candidate.id
+                        song_play_time = anchor_timestamp
+                        # 出声点已作为回溯锚点消费，启动后同歌 SONG_LOAD 不再归零
+                        anchor_is_song_load = True
+                        break
+                continue
+
+            if anchor_sid != -1:
+                # 元数据已由候选补齐，或还在继续找：不再处理其他切歌记录
+                continue
+
             if etype in ("SET_PLAYING", "PLAY_ONE_TRACKIN_PLAYING_LIST"):
                 data = parse_args(etype, line)
                 if data and isinstance(data, dict):
-                    song_track = self._make_track(data)
+                    candidate = self._make_track(data)
+                    # 回溯锚点若是 checkPlayPrivilege（权限预检），必须确认该曲确实
+                    # 出声过：否则"下一首播放"的预检会被误判成当前歌曲，启动即错曲。
+                    # 用"更近的日志里是否出现过该曲的出声证据"来判断。
+                    if (etype == "SET_PLAYING"
+                            and candidate.id != -1
+                            and candidate.id not in played_ids):
+                        continue
+                    song_track = candidate
                     song_id = song_track.id
                     song_play_time = header.timestamp
                 break
@@ -278,12 +384,21 @@ class CloudMusic:
                             song_play_time = header.timestamp
                             # 出声点已作为回溯锚点消费，启动后同歌 SONG_LOAD 不再归零
                             anchor_is_song_load = True
-                break
+                            break
+                        # webdb 只保留最近一次播放记录，多数情况查不到当前歌：
+                        # 记下出声的 songId，继续向更早的日志找同一首的完整元数据
+                        anchor_sid = sid
+                        anchor_timestamp = header.timestamp
+                        # 记录边界：回放进度只需"出声点之后"的日志，更早的行
+                        # 属于上一首，不能参与回放
+                        anchor_records_len = len(records)
+                continue
 
-        # 正序回放进度和状态
+        # 正序回放进度和状态（若锚点是从出声点回溯补齐元数据的，只回放出声点之后的日志）
         records.reverse()
+        start_index = (len(records) - anchor_records_len) if anchor_records_len else 0
         last_action = song_play_time
-        for line in records:
+        for line in records[start_index:]:
             header = parse_header(line)
             if not header:
                 continue
@@ -342,7 +457,11 @@ class CloudMusic:
             track = self._make_track(data)
             if track.id == self._song_id:
                 return
-            self._set_new_track(track, pausing=True)
+            # checkPlayPrivilege 只是"播放权限预检"，并不代表此刻真的切歌：
+            # "加入下一首播放"、把歌曲插进播放队列等操作同样会写这条日志。
+            # 因此这里只登记候选，等真正出声（NATIVE_SONG_LOAD / 播放状态 playId）
+            # 再确认，避免提前切歌导致歌词软件拉错歌词。
+            self._mark_pending(track, pausing=True)
             return
 
         if etype == "PLAY_ONE_TRACKIN_PLAYING_LIST":
@@ -352,7 +471,7 @@ class CloudMusic:
             track = self._make_track(data)
             if track.id == self._song_id:
                 return
-            self._set_new_track(track, pausing=False)
+            self._mark_pending(track, pausing=False)
             return
 
         if etype == "NATIVE_SONG_LOAD":
@@ -381,6 +500,18 @@ class CloudMusic:
                 return
             # 哈希型 songId（本地导入/无服务器 ID 的下载曲）无法查 webdb，忽略该事件
             if new_id == -1:
+                return
+            # 真正出声 = 切歌确认。若与候选一致，优先用候选里的完整元数据
+            # （checkPlayPrivilege 自带歌名/歌手，无需再查 webdb，既快又稳）。
+            pending = self._take_pending(new_id)
+            if pending is not None:
+                self._song_id = pending.id
+                self._track = pending
+                self._pausing = False
+                self._position = 0.0
+                self._relative_time = int(now - offset * 1000)
+                self._pos_anchored_since_switch = False
+                self._emit_track(pending)
                 return
             detail = self._webdb.wait_for_song_detail(new_id, timeout=2)
             if not detail:
@@ -412,9 +543,24 @@ class CloudMusic:
             st = parse_args(etype, line)
             if st is None:
                 return
+            paused = (int(st) == 2)
+            # 播放态事件的 playId 形如 "<songId>_<随机串>"，代表此刻真正出声的
+            # 播放实例。若它与某个候选一致，说明该候选已真正出声（极少数情况下
+            # SONG_LOAD 缺失），直接确认切歌；否则说明候选只是"下一首播放"之类的
+            # 权限预检，此时保留候选（等它真被播到时仍可用），不做任何状态变更。
+            play_id = parse_status_play_id(line)
+            play_song_id = (
+                self._safe_song_id(play_id.split("_")[0]) if play_id else -1
+            )
+            if play_song_id != -1:
+                pending = self._take_pending(play_song_id)
+                if pending is not None:
+                    self._set_new_track(pending, pausing=paused)
+                    self._emit_state(self.state)
+                    return
             new_rel = now - self._position * 1000
             new_pos = (now - self._relative_time) / 1000
-            self._pausing = (int(st) == 2)
+            self._pausing = paused
             self._position = new_pos - offset if self._pausing else 0
             self._relative_time = 0 if self._pausing else int(new_rel - offset * 1000)
             # 进度被显式锚定：暂停/恢复后的 NATIVE_SONG_LOAD 重载不归零

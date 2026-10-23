@@ -369,6 +369,132 @@ def test_header_timestamp_no_jitter():
     print()
 
 
+def test_pending_track():
+    print("=== 测试 11: 切歌候选（权限预检）不提前切歌 ===")
+
+    from cloudmusic_detector._elog_analysis import _get_system_uptime_ms
+    from cloudmusic_detector._constant import parse_args, parse_status_play_id
+
+    startup = _get_system_uptime_ms()
+    header = f"[123:456:0818/163136:{startup}:INFO:abc(1)] [2024-01-01 10:00:00]"
+
+    def priv_line(sid, name):
+        return (f'{header} 【playing】,"checkPlayPrivilege",'
+                f'{{"id":"{sid}","name":"{name}","artists":[{{"name":"歌手"}}],'
+                f'"album":{{"name":"专辑","cover":""}},"duration":180000}}')
+
+    def play_one_line(sid, name):
+        return (f'{header} 【playing】,"playOneTrackInPlayingList",'
+                f'{{"track":{{"id":"{sid}","name":"{name}","artists":[],'
+                f'"album":{{}},"duration":180000}}}}')
+
+    def load_line(sid):
+        return (f'{header} 【playing】,"native播放资源load完成，开始播放",'
+                f'{{"songId":"{sid}","bitrate":320}}')
+
+    def state_line(st, play_id):
+        return f'{header} 【playing】,"native播放state",{st},"{play_id}"'
+
+    # 带 playId 的状态行仍能正确解析出播放态与 playId
+    assert parse_args("SET_PLAYING_STATUS", state_line(1, "3_X1Y2Z3")) == "1"
+    assert parse_status_play_id(state_line(1, "3_X1Y2Z3")) == "3_X1Y2Z3"
+    assert parse_status_play_id(f'{header} 【playing】,"native播放state",1,') is None
+    print("  playId 解析（有/无该字段）OK")
+
+    cm = CloudMusic()
+    changes = []
+    cm.on_track_change(lambda t: changes.append(t.id))
+    cm._set_new_track(Track(id=1, name="A", duration=180.0), pausing=False)
+    changes.clear()
+
+    # 场景 1：“下一首播放”B 只写 checkPlayPrivilege，没有任何出声事件
+    cm._relative_time -= 5000  # 让当前曲目已播 ~5s
+    pos_before = cm.state.position
+    cm._handle_line(priv_line(2, "B"))
+    assert changes == [], f"权限预检不应推送切歌，实际推送 {changes}"
+    assert cm.track.id == 1, f"当前曲目应仍是 A，实际 {cm.track.id}"
+    assert cm.is_playing, "当前曲目应继续播放"
+    assert abs(cm.state.position - pos_before) < 0.5, \
+        f"权限预检不应重置进度，{pos_before:.2f}s -> {cm.state.position:.2f}s"
+    print("  预检 B → 无切歌回调，仍在播放 A（进度未重置）OK")
+
+    # 场景 2：随后 A 的播放态事件（playId 前缀为 A）不得改变状态，也不切歌
+    cm._handle_line(state_line(1, "1_AAAAAA"))
+    assert cm.track.id == 1 and changes == [], "A 的播放态事件不应触发切歌"
+    assert cm._pending_tracks.get(2) is not None, \
+        "候选应保留，等它真正被播到时仍可直接确认"
+    print("  A 的 playId 事件 → 状态不变、候选保留 OK")
+
+    # 场景 3：真正切到 B（playOne + SONG_LOAD）只推送一次
+    cm._handle_line(play_one_line(2, "B"))
+    assert changes == [], "playOneTrackInPlayingList 单独出现不应切歌"
+    cm._handle_line(load_line(2))
+    assert changes == [2], f"SOUND_LOAD 确认后应恰好推送一次，实际 {changes}"
+    assert cm.track.id == 2
+    print("  出声点确认 → 恰好一次切歌回调 OK")
+
+    # 场景 4：SOUND_LOAD 缺失时由 playId 确认
+    changes.clear()
+    cm._handle_line(priv_line(3, "C"))
+    assert changes == [] and cm.track.id == 2
+    cm._handle_line(state_line(1, "3_CCCCCC"))
+    assert changes == [3], f"playId 确认后应推送切歌，实际 {changes}"
+    assert cm.track.id == 3
+    print("  playId 确认（无 SONG_LOAD）→ 切歌 OK")
+
+    # 场景 5：预检曲目与当前曲目相同时不登记候选
+    cm._handle_line(priv_line(3, "C"))
+    assert cm._pending_tracks == {} and changes == [3]
+    print("  预检与当前曲目相同 → 不登记候选 OK")
+
+    # 场景 6：连续“下一首播放”多首，不应互相覆盖；播放其中任意一首都能确认
+    cm4 = CloudMusic()
+    cm4_changes = []
+    cm4.on_track_change(lambda t: cm4_changes.append(t.name))
+    cm4._set_new_track(Track(id=10, name="A", duration=180.0), pausing=False)
+    cm4_changes.clear()
+    for sid, name in ((11, "B"), (12, "C"), (13, "D")):
+        cm4._handle_line(priv_line(sid, name))
+    assert cm4_changes == [], "连续预检不应推送切歌"
+    assert sorted(cm4._pending_tracks) == [11, 12, 13], \
+        f"候选应互不覆盖，实际 {sorted(cm4._pending_tracks)}"
+    # 用户先播第三首 D：只应推送 D 一次，且直接复用候选元数据
+    cm4._handle_line(load_line(13))
+    assert cm4_changes == ["D"], f"应恰好推送 D，实际 {cm4_changes}"
+    assert sorted(cm4._pending_tracks) == [11, 12], "其余候选应保留"
+    print("  连续预检多首 → 互不覆盖，播放任一首均正确确认 OK")
+
+    # 场景 7：_preload 应过滤掉“未出声”的预检锚点
+    cm2 = CloudMusic()
+    cm2._preload([
+        priv_line(4, "D"),
+        state_line(1, "4_DDDDDD"),
+        priv_line(5, "E"),  # 仅“下一首播放”E，未真正出声
+    ])
+    assert cm2.track.id == 4, f"回溯锚点应是已出声的 D，实际 {cm2.track.id}"
+    print("  _preload 跳过未出声的预检锚点 OK")
+
+    # 场景 8：全程只有预检、无任何出声证据 → 回溯不出曲目
+    cm3 = CloudMusic()
+    cm3._preload([priv_line(6, "F")])
+    assert cm3.track.id == -1, f"无出声证据时不应判定当前曲目，实际 {cm3.track.id}"
+    print("  _preload 仅有预检 → 无当前曲目 OK")
+
+    # 场景 9：出声点查不到 webdb（只存最近一次播放，通常早已过期）时，
+    # 应继续向更早的日志取同一首的预检记录补齐歌名歌手
+    cm5 = CloudMusic()
+    cm5._webdb.wait_for_song_detail = lambda sid, timeout=2: None
+    cm5._preload([
+        priv_line(7, "G"),          # 更早：预检 G，带完整元数据
+        state_line(1, "1_AAAAAA"),
+        load_line(7),               # 出声点：G 开始播放，但 webdb 查不到
+    ])
+    assert cm5.track.id == 7, f"应回溯到出声的 G，实际 {cm5.track.id}"
+    assert cm5.track.name == "G", f"应补齐歌名，实际 {cm5.track.name!r}"
+    print("  _preload 出声点查不到 webdb → 用更早的预检补齐元数据 OK")
+    print()
+
+
 if __name__ == "__main__":
     print("cloudmusic_detector API 测试\n")
     print("-" * 50)
@@ -382,5 +508,6 @@ if __name__ == "__main__":
     test_hash_song_id()
     test_song_load_rebase()
     test_header_timestamp_no_jitter()
+    test_pending_track()
     print("-" * 50)
     print("\nAll passed!")

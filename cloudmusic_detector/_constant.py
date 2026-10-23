@@ -38,7 +38,10 @@ def _extract_group(row: str, pattern: str) -> Optional[str]:
 
 # 正则预编译
 _RE_POSITION = re.compile(r"【playing】,\"setPlayingPosition\",(\d+(?:\.\d+)?)")
-_RE_STATUS = re.compile(r"【playing】,\"native播放state\",(\d+),")
+# native播放state 形如：,"native播放state",1,"1887467089_Q8X6EM"
+# 其中第三段 playId 为 "<songId>_<随机串>"，代表此刻真正出声的那首歌
+_RE_STATUS = re.compile(r"【playing】,\"native播放state\",(\d+)(?:,\"([^\"]*)\")?")
+_RE_STATUS_PLAYID = re.compile(r"【playing】,\"native播放state\",\d+,\"([^\"]*)\"")
 
 
 ELOG_RULES = {
@@ -77,3 +80,13 @@ ELOG_RULES = {
 
 def parse_args(event_type: str, row: str) -> Any:
     return ELOG_RULES[event_type]["args"](row)
+
+
+def parse_status_play_id(row: str) -> Optional[str]:
+    """从 native播放state 行中提取 playId（形如 ``"<songId>_<随机串>"``）。
+
+    该字段代表此刻真正出声的播放实例，是区分"真切歌"和"权限预检"的关键证据。
+    老版本客户端可能没有该字段，此时返回 None。
+    """
+    m = _RE_STATUS_PLAYID.search(row)
+    return m.group(1) if m else None
